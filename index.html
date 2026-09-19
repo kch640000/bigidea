@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<base target="_top">
 <title>단원 핵심아이디어 도출 도구</title>
 <style>
   :root{
@@ -47,6 +48,17 @@
     box-shadow:0 2px 12px rgba(30,40,90,0.18);
   }
   .brand{display:flex;flex-direction:column;gap:2px;}
+  .save-status{
+    font-size:12px;font-weight:600;color:#fff;
+    background:rgba(255,255,255,0.2);
+    border-radius:20px;padding:5px 11px;white-space:nowrap;
+    display:inline-flex;align-items:center;gap:5px;
+  }
+  .save-status::before{content:"●";font-size:9px;opacity:0.9;}
+  .save-status.is-ok::before{color:#b8f0c8;}
+  .save-status.is-pending::before{color:#ffe9a8;}
+  .save-status.is-err{background:rgba(255,120,110,0.38);}
+  .save-status.is-err::before{color:#ffd0cb;}
   .brand .title{font-size:18px;font-weight:800;letter-spacing:-0.2px;}
   .brand .subtitle{font-size:12px;opacity:0.85;}
   .top-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
@@ -247,6 +259,7 @@
     <div class="subtitle">교과 핵심아이디어 → 성취기준 → 삶의 맥락 → 개념 → 단원 핵심아이디어 · 핵심질문</div>
   </div>
   <div class="top-actions no-print">
+    <span class="save-status is-pending" id="saveStatus">준비 중…</span>
     <select id="unitSwitcher" title="저장된 단원 불러오기"></select>
     <button class="btn-ghost btn-sm" id="btnNewUnit">＋ 새 단원</button>
     <button class="btn-primary btn-sm" id="btnSaveUnit">💾 저장</button>
@@ -472,7 +485,15 @@
         <h2 style="font-size:14px;">저장된 단원</h2>
       </div>
       <div id="unitListSidebar"></div>
-      <div class="small-note" style="margin-top:8px;">브라우저(localStorage)에 자동 저장됩니다. 다른 PC와 공유되지 않으니, 중요한 결과는 텍스트 복사/인쇄로 백업하세요.</div>
+      <div class="small-note" style="margin-top:8px;">작업 내용은 <b>구글 스프레드시트</b>에 자동 저장됩니다. 로그인한 계정으로 접속하면 어느 PC에서든 이어서 작업할 수 있습니다.</div>
+      <div class="toolbar no-print" style="margin-top:8px;margin-bottom:0;">
+        <button type="button" class="btn-outline btn-sm" id="btnOpenSheet">📊 저장 시트 열기</button>
+        <button type="button" class="btn-outline btn-sm" id="btnReloadStore">↻ 다시 불러오기</button>
+      </div>
+      <div class="toolbar no-print" style="margin-top:6px;margin-bottom:0;">
+        <button type="button" class="btn-danger-outline btn-sm" id="btnResetSubjects">교육과정 원자료 초기화</button>
+      </div>
+      <div class="small-note" style="margin-top:6px;">※ 초기화는 <b>교과·핵심아이디어·성취기준 목록</b>만 최초 상태로 되돌립니다. 작성한 단원은 그대로 유지됩니다.</div>
     </div>
   </aside>
 </div>
@@ -2148,26 +2169,129 @@ function sid(){ return 'st_' + Date.now().toString(36) + Math.random().toString(
 function esc(s){ return (s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function nowStr(){ return new Date().toISOString(); }
 
-/* ============ 상태 ============ */
-const STORAGE_KEY = 'hci_tool_data_v6';
-let store = loadStore();
+/* ============ 상태 (Google Sheets 서버 저장) ============ */
+let store = { subjects:{}, units:[], currentUnitId:null };
+let ready = false;
 
 /* 화면 필터 상태(저장되지 않음, 교과별로 유지) */
 const uiState = { ideaArea:{}, stdGrade:{}, stdArea:{} };
 function getFilter(map, subject){ return map[subject] || '전체'; }
 function setFilter(map, subject, val){ map[subject] = val; }
 
-function loadStore(){
-  try{
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if(raw) return JSON.parse(raw);
-  }catch(e){}
+function freshStore(){
   const fresh = { subjects: seedData(), units: [], currentUnitId: null };
-  fresh.units.push(makeUnit(Object.keys(fresh.subjects)[0]));
-  fresh.currentUnitId = fresh.units[0].id;
+  const firstSubject = Object.keys(fresh.subjects)[0];
+  const nu = {
+    id: uid(), createdAt: nowStr(), updatedAt: nowStr(),
+    subject: firstSubject, unitName: '', gradeBand: '', lessonHours: '',
+    selectedCoreIdeaIds: [], selectedStandardIds: [],
+    lifeContext: '', concepts: [], unitCoreIdea: '', essentialQuestions: [{text:'', type:''}],
+    gen1: '', gen2: '', gen3: '', genNotes: ''
+  };
+  fresh.units.push(nu);
+  fresh.currentUnitId = nu.id;
   return fresh;
 }
-function persist(){ localStorage.setItem(STORAGE_KEY, JSON.stringify(store)); }
+
+/* ---- 저장 상태 표시 ---- */
+const saveStatusEl = document.getElementById('saveStatus');
+function setSaveStatus(kind, msg){
+  if(!saveStatusEl) return;
+  saveStatusEl.className = 'save-status is-' + kind;
+  saveStatusEl.textContent = msg;
+}
+function hhmm(){
+  const d = new Date();
+  return ('0'+d.getHours()).slice(-2) + ':' + ('0'+d.getMinutes()).slice(-2);
+}
+
+/* ---- 자동 저장 (디바운스 + 교과자료 변경분만 전송) ---- */
+const SAVE_DELAY = 900;
+let lastSubjectsSig = null;
+let saveTimer = null;
+let savePending = false;
+let saveInFlight = false;
+
+function persist(){
+  if(!ready) return;
+  savePending = true;
+  setSaveStatus('pending', '저장 중…');
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flushSave, SAVE_DELAY);
+}
+
+function flushSave(){
+  clearTimeout(saveTimer);
+  if(!ready || !savePending || saveInFlight) return;
+  savePending = false;
+  saveInFlight = true;
+  setSaveStatus('pending', '저장 중…');
+
+  const sig = JSON.stringify(store.subjects);
+  const subjectsChanged = (sig !== lastSubjectsSig);
+  const payload = JSON.stringify({
+    units: store.units,
+    currentUnitId: store.currentUnitId,
+    subjects: subjectsChanged ? store.subjects : null
+  });
+
+  google.script.run
+    .withSuccessHandler(function(){
+      saveInFlight = false;
+      if(subjectsChanged) lastSubjectsSig = sig;
+      if(savePending){ flushSave(); }
+      else { setSaveStatus('ok', '저장됨 ' + hhmm()); }
+    })
+    .withFailureHandler(function(err){
+      saveInFlight = false;
+      savePending = true;
+      setSaveStatus('err', '저장 실패 · 재시도 중');
+      setTimeout(flushSave, 5000);
+    })
+    .saveStore(payload);
+}
+
+window.addEventListener('beforeunload', function(e){
+  if(savePending || saveInFlight){
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+/* ---- 최초 로딩 ---- */
+function bootstrap(){
+  setSaveStatus('pending', '불러오는 중…');
+  google.script.run
+    .withSuccessHandler(function(json){
+      let data = null;
+      try{ data = json ? JSON.parse(json) : null; }catch(e){ data = null; }
+      const hasSubjects = data && data.subjects && Object.keys(data.subjects).length;
+      const hasUnits = data && Array.isArray(data.units) && data.units.length;
+      if(hasSubjects && hasUnits){
+        store = data;
+        setSaveStatus('ok', '불러옴 ' + hhmm());
+      }else{
+        store = freshStore();
+        setSaveStatus('pending', '처음 설정 중…');
+      }
+      lastSubjectsSig = hasSubjects ? JSON.stringify(store.subjects) : null;
+      ensureUnit();
+      ready = true;
+      render();
+      if(!(hasSubjects && hasUnits)) persist();
+    })
+    .withFailureHandler(function(err){
+      store = freshStore();
+      lastSubjectsSig = null;
+      ensureUnit();
+      ready = true;
+      render();
+      setSaveStatus('err', '불러오기 실패 · 임시 사용 중');
+      alert('저장된 자료를 불러오지 못했습니다.\n\n' + (err && err.message ? err.message : err) +
+            '\n\n화면은 초기 상태로 열렸습니다. 이 상태에서 작업하면 기존 자료를 덮어쓸 수 있으니, 먼저 [↻ 다시 불러오기]를 눌러 보세요.');
+    })
+    .loadStore();
+}
 
 function makeUnit(subject){
   return {
@@ -2193,7 +2317,6 @@ function ensureUnit(){
     store.currentUnitId = nu.id;
   }
 }
-ensureUnit();
 
 /* ============ 모달 헬퍼 ============ */
 const modalBackdrop = document.getElementById('modalBackdrop');
@@ -3078,19 +3201,19 @@ function renderSidebarUnits(){
 
 /* ============ 상단 컨트롤 이벤트 ============ */
 document.getElementById('unitName').addEventListener('input', e=>{
-  const unit = getCurrentUnit(); unit.unitName = e.target.value; unit.updatedAt = nowStr(); persist();
+  const unit = getCurrentUnit(); if(!unit) return; unit.unitName = e.target.value; unit.updatedAt = nowStr(); persist();
   renderUnitSwitcher(); renderSidebarUnits(); renderSummary(unit);
 });
 document.getElementById('gradeBand').addEventListener('input', e=>{
-  const unit = getCurrentUnit(); unit.gradeBand = e.target.value; unit.updatedAt = nowStr(); persist();
+  const unit = getCurrentUnit(); if(!unit) return; unit.gradeBand = e.target.value; unit.updatedAt = nowStr(); persist();
   renderSidebarUnits(); renderSummary(unit);
 });
 document.getElementById('lessonHours').addEventListener('input', e=>{
-  const unit = getCurrentUnit(); unit.lessonHours = e.target.value; unit.updatedAt = nowStr(); persist();
+  const unit = getCurrentUnit(); if(!unit) return; unit.lessonHours = e.target.value; unit.updatedAt = nowStr(); persist();
   renderSummary(unit);
 });
 document.getElementById('lifeContext').addEventListener('input', e=>{
-  const unit = getCurrentUnit(); unit.lifeContext = e.target.value; unit.updatedAt = nowStr(); persist();
+  const unit = getCurrentUnit(); if(!unit) return; unit.lifeContext = e.target.value; unit.updatedAt = nowStr(); persist();
   renderProgress(unit); renderSummary(unit);
 });
 
@@ -3098,24 +3221,63 @@ document.getElementById('unitSwitcher').addEventListener('change', e=>{
   store.currentUnitId = e.target.value; persist(); render();
 });
 document.getElementById('btnNewUnit').addEventListener('click', ()=>{
-  const nu = makeUnit(getCurrentUnit().subject);
+  if(!ready) return;
+  const cur = getCurrentUnit();
+  const nu = makeUnit(cur ? cur.subject : '');
   store.units.push(nu);
   store.currentUnitId = nu.id;
   persist(); render();
 });
 document.getElementById('btnSaveUnit').addEventListener('click', ()=>{
+  if(!ready) return;
   const unit = getCurrentUnit();
-  unit.updatedAt = nowStr();
-  persist();
+  if(unit) unit.updatedAt = nowStr();
+  savePending = true;
+  flushSave();
   const btn = document.getElementById('btnSaveUnit');
   const orig = btn.textContent;
-  btn.textContent = '✓ 저장됨';
+  btn.textContent = '✓ 전송됨';
   setTimeout(()=>btn.textContent=orig, 1200);
+});
+document.getElementById('btnReloadStore').addEventListener('click', ()=>{
+  if(savePending || saveInFlight){
+    if(!confirm('저장되지 않은 변경이 있습니다. 그래도 서버 자료를 다시 불러올까요?')) return;
+  }
+  savePending = false; saveInFlight = false; ready = false;
+  clearTimeout(saveTimer);
+  bootstrap();
+});
+document.getElementById('btnOpenSheet').addEventListener('click', ()=>{
+  const btn = document.getElementById('btnOpenSheet');
+  const orig = btn.textContent;
+  btn.textContent = '여는 중…';
+  google.script.run
+    .withSuccessHandler(url=>{
+      btn.textContent = orig;
+      if(url) window.open(url, '_blank');
+      else alert('스프레드시트 주소를 확인할 수 없습니다.');
+    })
+    .withFailureHandler(err=>{
+      btn.textContent = orig;
+      alert('스프레드시트를 열 수 없습니다.\n' + (err && err.message ? err.message : err));
+    })
+    .getSheetUrl();
+});
+document.getElementById('btnResetSubjects').addEventListener('click', ()=>{
+  if(!ready) return;
+  if(!confirm('교과·핵심아이디어·성취기준 목록을 최초 제공 상태로 되돌립니다.\n직접 추가·수정한 항목은 사라집니다. (작성한 단원은 그대로 유지)\n\n계속할까요?')) return;
+  store.subjects = seedData();
+  const names = Object.keys(store.subjects);
+  store.units.forEach(u=>{
+    if(names.indexOf(u.subject) === -1) u.subject = names[0];
+  });
+  persist(); flushSave(); render();
 });
 document.getElementById('btnPrint').addEventListener('click', ()=>window.print());
 document.getElementById('btnPrint2').addEventListener('click', ()=>window.print());
 document.getElementById('btnCopySummary').addEventListener('click', async ()=>{
   const unit = getCurrentUnit();
+  if(!unit) return;
   const text = buildSummaryText(unit);
   try{
     await navigator.clipboard.writeText(text);
@@ -3128,7 +3290,7 @@ document.getElementById('btnCopySummary').addEventListener('click', async ()=>{
   }
 });
 
-render();
+bootstrap();
 })();
 </script>
 </body>
